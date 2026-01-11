@@ -1,262 +1,416 @@
+
 import streamlit as st
 import pandas as pd
-import google.generativeai as genai
-import os
-import json
+import numpy as np
+from datetime import datetime
 from dotenv import load_dotenv
+import os
 
-# --- Page Config ---
-st.set_page_config(page_title="AI Real Estate Agent", layout="wide")
+from src.core.profile_manager import ProfileManager  # Fixed path
+from src.core.keyword_search import KeywordSearchEngine
+from src.agents.simple_extractor import SimpleExtractor
+from src.agents.context_aware_sales import ContextAwareSalesAgent
+from src.agents.orchestrator import OrchestratorAgent
 
-# --- Setup Gemini ---
+# --- Setup ---
 load_dotenv()
-api_key = os.getenv("GOOGLE_API_KEY")
+st.set_page_config(page_title="AI Real Estate Agent V4 (RAG)", layout="wide")
 
-if not api_key:
-    st.error("GOOGLE_API_KEY not found in .env file. Please add it.")
+if not os.getenv("GOOGLE_API_KEY"):
+    st.error("Please set GOOGLE_API_KEY in .env")
     st.stop()
 
-if api_key:
-    genai.configure(api_key=api_key)
-    model = genai.GenerativeModel('gemini-2.5-flash')
-else:
-    st.warning("Please provide a Google API Key to proceed.")
-    st.stop()
+# Initialize Components
+if 'components_initialized' not in st.session_state:
+    st.session_state.components = {
+        "profile_mgr": ProfileManager(),
+        "search_engine": KeywordSearchEngine(),  # NEW: Simple keyword search
+        "orchestrator": OrchestratorAgent(),
+        "extractor": SimpleExtractor(),  # NEW: Simple extraction
+        "sales": ContextAwareSalesAgent()
+    }
+    st.session_state.components_initialized = True
 
-# --- Load Data ---
-@st.cache_data
-def load_data():
-    try:
-        df = pd.read_excel('banglore_pools.xlsx')
-        # Normalize column names
-        df.columns = [c.strip() for c in df.columns]
-        
-        # Helper to clean price
-        def parse_price(val):
-            if pd.isna(val): return 0
-            s = str(val).lower().replace('₹', '').replace(',', '').strip()
-            try:
-                if 'cr' in s:
-                    return float(s.replace('cr', '').strip()) * 10000000
-                if 'l' in s or 'lac' in s:
-                    return float(s.replace('l', '').replace('lac', '').strip()) * 100000
-                
-                # Handle ranges like "11000-13000"
-                if '-' in s:
-                    parts = s.split('-')
-                    avg = sum(float(p.strip()) for p in parts) / len(parts)
-                    return avg
-                    
-                return float(s)
-            except:
-                return 0
-                
-        # Create a numeric price column if possible, otherwise rely on AI reading text
-        # Let's try to parse 'Price per sqft (Enriched)' if it exists, or just keep as is.
-        # Based on previous inspection, we have 'Price per sqft (Enriched)'.
-        if 'Price per sqft (Enriched)' in df.columns:
-            df['price_numeric'] = df['Price per sqft (Enriched)'].apply(parse_price)
-            
-        return df
-    except Exception as e:
-        st.error(f"Error loading data: {e}")
-        return pd.DataFrame()
+comps = st.session_state.components
 
-df = load_data()
+# --- UI Styling & Animations ---
+st.markdown("""
+<style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
 
-# --- Session State Management ---
-if 'messages' not in st.session_state:
-    st.session_state.messages = []
-
-if 'user_preferences' not in st.session_state:
-    st.session_state.user_preferences = {
-        "location": None,
-        "min_price": None,
-        "max_price": None,
-        "bhk": None,
-        "amenities": []
+    /* Global Reset & Typography */
+    html, body, [class*="css"] {
+        font-family: 'Inter', sans-serif;
+        font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+        -webkit-font-smoothing: antialiased;
     }
 
-# --- Helper Functions ---
+    /* Professional Dark Theme (Vercel/Apple Style) */
+    .stApp {
+        background-color: #000000;
+        color: #ededed;
+    }
 
-def clean_price(price_str):
-    """Attempt to convert price string to float number."""
-    if isinstance(price_str, (int, float)):
-        return float(price_str)
-    try:
-        # Remove chars like '₹', ',', 'lac', 'cr' and convert
-        # This is a basic cleaner, might need refinement based on data
-        p = str(price_str).lower().replace(',', '').replace('₹', '')
-        if 'cr' in p:
-            return float(p.replace('cr', '').strip()) * 10000000
-        if 'l' in p or 'lac' in p:
-            return float(p.replace('l', '').replace('lac', '').strip()) * 100000
-        return float(p)
-    except:
-        return 0
-
-def search_properties(preferences, dataframe):
-    if dataframe is None or dataframe.empty:
-        return pd.DataFrame()
-        
-    filtered_df = dataframe.copy()
+    /* Remove Streamlit branding/padding quirks */
+    .main .block-container {
+        padding-top: 2rem;
+        padding-bottom: 5rem;
+        max-width: 1000px;
+    }
     
-    # Filter by Location (Flexible Token Match)
-    if preferences.get('location') and isinstance(preferences['location'], str):
-        loc_term = preferences['location'].lower()
-        # Split terms to allow "Electronic City" to match "Electronic City Phase 2"
-        # but avoid very short common words if possible, though simple 'and' logic is usually better
-        # Let's try: if the location string provided by user is a substring of the data.
+    header { visibility: hidden; }
+    footer { visibility: hidden; }
+
+    /* --- Chat Bubbles --- */
+    /* User Message - Blue/Modern */
+    .stChatMessage[data-testid="stChatMessage"]:nth-child(odd) {
+        background-color: transparent;
+    }
+    
+    div[data-testid="chatAvatarIcon-user"] {
+        background-color: #007AFF !important;
+        color: white !important;
+    }
+    
+    /* Assistant Message - Clean/Dark */
+    div[data-testid="chatAvatarIcon-assistant"] {
+        background-color: #1c1c1e !important;
+        color: #a1a1aa !important;
+    }
+
+    /* Message Content Container */
+    [data-testid="stChatMessageContent"] {
+        border-radius: 12px;
+        padding: 12px 16px;
+        box-shadow: 0 1px 2px rgba(0,0,0,0.1);
+        border: 1px solid rgba(255,255,255,0.1);
+    }
+    
+    /* Specific User Bubble Style (Targeting user role via CSS if possible, else generic) */
+    /* Note: Streamlit doesn't expose role class on the container easily, relying on JS usually.
+       We'll style the generics clean. */
+       
+    [data-testid="stChatMessageContent"] {
+        background: #111111;
+    }
+
+    /* --- Property Cards (Minimalist) --- */
+    .property-card {
+        background: #09090b; 
+        border: 1px solid #18181b; 
+        border-radius: 8px; /* Sharper corners */
+        padding: 16px;
+        transition: all 0.2s ease;
+        height: 100%;
+        display: flex;
+        flex-direction: column;
+        justify-content: space-between;
+        position: relative;
+    }
+
+    .property-card:hover {
+        border-color: #3f3f46; 
+        background: #101012;
+    }
+
+    .card-title {
+        font-size: 0.95rem;
+        font-weight: 600;
+        color: #ffff;
+        margin-bottom: 2px;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+    }
+    
+    .card-dev {
+        font-size: 0.75rem;
+        color: #71717a;
+        margin-bottom: 12px;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+    }
+
+    /* --- Ghost Button (View Details) --- */
+    .stButton button {
+        background: transparent;
+        color: #a1a1aa;
+        border: 1px solid #27272a;
+        border-radius: 6px;
+        padding: 6px 12px;
+        font-size: 0.8rem;
+        font-weight: 500;
+        transition: all 0.1s;
+        box-shadow: none;
+        width: 100%;
+    }
+    
+    .stButton button:hover {
+        background: #ffffff;
+        color: #000000;
+        border-color: #ffffff;
+        transform: none; /* remove scale */
+        box-shadow: 0 4px 12px rgba(255,255,255,0.1);
+    }
+    
+    /* Active Card Highlight */
+    .property-card.active {
+        border-color: #fff;
+        background: #101012;
+    }
+
+    /* Hero Text */
+    .hero-title {
+        font-size: 2rem;
+        font-weight: 700;
+        color: #ffffff;
+        letter-spacing: -0.02em;
+        margin-bottom: 0.2rem;
+        text-align: left;
+    }
+    
+    .hero-subtitle {
+        font-size: 1rem;
+        color: #71717a;
+        font-weight: 400;
+        text-align: left;
+        margin-bottom: 2rem;
+    }
+
+    /* Right Panel Styling */
+    .right-panel {
+        background: #09090b;
+        border-left: 1px solid #27272a;
+        height: 100vh;
+        padding: 20px;
+        position: fixed; 
+        right: 0; 
+        top: 0;
+        overflow-y: auto;
+    }
+
+</style>
+""", unsafe_allow_html=True)
+
+# --- Logic: Detail Panel ---
+def render_details_panel(row):
+    """Renders the details in the right column"""
+    with st.container(border=True):
+        c1, c2 = st.columns([0.85, 0.15])
+        with c1:
+            st.markdown(f"### {row.get('Project Name', 'N/A')}")
+            st.caption(f"by {row.get('Developer', 'Unknown')}")
+        with c2:
+            if st.button("✕", key="close_details"):
+                st.session_state.selected_property = None
+                st.rerun()
+
+        st.divider()
+
+        # Tabs for details
+        t1, t2, t3, t4 = st.tabs(["Overview", "Specs", "Finance", "ROI Tool"])
         
-        cols_to_search = [c for c in ['Location', 'Region', 'Address Map'] if c in filtered_df.columns]
-        
-        # Create a mask for any match
-        mask = pd.Series(False, index=filtered_df.index)
-        for col in cols_to_search:
-            # We check if the user's location term is contained in the column
-            mask |= filtered_df[col].astype(str).str.lower().str.contains(loc_term, na=False)
+        with t1:
+            st.markdown(f"**📍 Location:** {row.get('Location', '-')}")
+            st.markdown(f"**🏙️ Region:** {row.get('Region', '-')}")
+            st.markdown(f"**🏗️ Status:** {row.get('Project Status', '-')}")
+            st.markdown("---")
+            st.info(f"**Amenities:** {row.get('Key Amenities', 'N/A')}")
+
+        with t2:
+            st.caption("Key Specifications")
+            # Safe filtering for specs
+            specs = {}
+            for k, v in row.items():
+                if k in ['search_blob', 'price_numeric', 'parsed_price']:
+                    continue
+                
+                # Safe check
+                is_valid = False
+                if isinstance(v, (list, tuple, np.ndarray)):
+                    is_valid = len(v) > 0
+                else:
+                    is_valid = pd.notna(v)
+                
+                if is_valid:
+                    specs[k] = v
+
+            # Display important specs first
+            cols = ['Project Type', 'Total Units', 'Total Land Area (Acres)']
+            for c in cols:
+                if c in specs:
+                    st.markdown(f"**{c}:** {specs[c]}")
             
-        filtered_df = filtered_df[mask]
-        
-    # Filter by Price (if parsed)
-    if 'price_numeric' in filtered_df.columns:
-        if preferences.get('min_price'):
+            with st.expander("See All Data"):
+                st.json(str(specs)) # Simple dump for now or formatted list
+
+        with t3:
+            # Handle Price Parsing Safely
+            raw_price = row.get('Price per sqft (Enriched)', 0)
+            price = 0
             try:
-                min_p = float(preferences['min_price'])
-                filtered_df = filtered_df[filtered_df['price_numeric'] >= min_p]
-            except: pass
+                if isinstance(raw_price, (int, float)):
+                    price = raw_price
+                elif isinstance(raw_price, str):
+                    # Robust cleaning: Remove currency, commas, tildes, approx symbols
+                    clean_price = raw_price.replace('₹', '').replace(',', '').replace('~', '').strip()
+                    
+                    # Handle ranges like "4500 - 5000" (Take the lower bound for conservative estimates)
+                    if '-' in clean_price:
+                        clean_price = clean_price.split('-')[0].strip()
+                        
+                    # Handle "On Request" or text
+                    if clean_price.replace('.', '', 1).isdigit():
+                        price = float(clean_price)
+            except:
+                price = 0
+
+            st.metric("Price/SqFt", f"₹{price}")
             
-        if preferences.get('max_price'):
-            try:
-                max_p = float(preferences['max_price'])
-                filtered_df = filtered_df[filtered_df['price_numeric'] <= max_p]
-            except: pass
+            if price > 0:
+                st.markdown("#### Estimated Cost")
+                st.write(f"1200 sqft: **₹{(price * 1200 / 10000000):.2f} Cr**")
+                st.write(f"1500 sqft: **₹{(price * 1500 / 10000000):.2f} Cr**")
+            else:
+                st.warning("Price data unavailable for calculation.")
+
+        with t4:
+            st.write("#### 📈 Investment Projector")
+            appr = st.slider("Annual Growth %", 5, 20, 8, key=f"roi_slider_{row.get('Project Name')}")
+            yrs = st.slider("Years", 1, 10, 5, key=f"roi_years_{row.get('Project Name')}")
             
-    # Filter by Developer
-    if preferences.get('developer'):
-        dev = preferences['developer'].lower()
-        if 'Developer' in filtered_df.columns:
-            filtered_df = filtered_df[filtered_df['Developer'].astype(str).str.lower().str.contains(dev, na=False)]
-    
-    # Return more results to ensure we fill the grid
-    return filtered_df.head(20)
+            if price > 0:
+                initial = price * 1500 # Base 1500 sqft
+                final = initial * ((1 + appr/100) ** yrs)
+                profit = final - initial
+                
+                st.success(f"Proj. Profit: **₹{profit/100000:.1f} Lakhs**")
+                
+                # Simple Chart
+                chart_data = pd.DataFrame({
+                    "Year": [f"Year {i}" for i in range(yrs + 1)],
+                    "Value": [initial * ((1 + appr/100) ** i) for i in range(yrs + 1)]
+                })
+                st.line_chart(chart_data.set_index("Year"))
 
-def extract_intent(user_input, current_prefs):
-    """
-    Uses Gemini to update the user preferences JSON.
-    """
-    prompt = f"""
-    You are a smart data extraction assistant.
-    Current User Preferences: {json.dumps(current_prefs)}
-    User Input: "{user_input}"
-    
-    Task: 
-    1. Update the 'Current User Preferences' based on the 'User Input'.
-    2. Overwrite values if new information is provided.
-    3. For 'location', extract the general area name (e.g. 'Whitefield', 'Electronic City') rather than full address.
-    4. For prices, convert 'k', 'lakh', 'cr' to absolute numbers (e.g. '10k' -> 10000, '1.5cr' -> 15000000).
-    5. Extract 'developer' if the user mentions a builder (e.g. 'Prestige', 'Brigade', 'Sobha').
-    6. CRITICAL: If the user changes the topic (e.g. asks about a different location or developer completely), CLEAR the previous incompatible preferences (e.g. reset 'location' if asking about a specific builder whose projects might be elsewhere, or if they explicitly say 'what about North Bangalore').
-    7. Return ONLY the updated JSON string. No markdown, no explanation.
-    """
-    try:
-        response = model.generate_content(prompt)
-        # Clean response to get pure JSON
-        cleaned_text = response.text.replace('```json', '').replace('```', '').strip()
-        return json.loads(cleaned_text)
-    except Exception as e:
-        print(f"Error extraction: {e}")
-        return current_prefs
+# --- User Session ---
+if 'user_id' not in st.session_state:
+    st.session_state.user_id = "user_001"
+    st.session_state.messages = []
+if 'selected_property' not in st.session_state:
+    st.session_state.selected_property = None
 
-def generate_sales_response(user_input, matches, preferences):
-    """
-    Generates a conversational response and sales pitch.
-    """
-    match_count = len(matches)
-    matches_str = matches.to_string() if not matches.empty else "No direct matches found."
-    
-    prompt = f"""
-    You are an expert Real Estate Agent interacting with a customer on a call.
-    
-    User Input: "{user_input}"
-    Current Preferences: {json.dumps(preferences)}
-    
-    Found {match_count} Properties matching the criteria.
-    Available Matches (Sample):
-    {matches_str}
-    
-    Task:
-    1. Acknowledge the user's request enthusiastically.
-    2. analyze the 'Found {match_count} Properties':
-       - If {match_count} > 5 OR if the user request is very broad:
-         * Mention you have found {match_count} great options (which are displayed).
-         * Ask CLARIFYING QUESTIONS to help narrow down the selection from this list. (e.g., "I've pulled up {match_count} properties for you. To help us zero in on the best one, what is your budget range?").
-       - If {match_count} <= 5:
-         * Pitch the specific options. Highlight why they fit.
-         * Treat them as a "shortlist" for the user to consider.
-         * Ask which one they would like to explore further.
-         * Do NOT immediately assume one is the "perfect" choice unless it's the only one.
-         
-    3. Keep the tone professional, persuasive, and conversational.
-    4. Do NOT output JSON. Output natural language text.
-    """
-    response = model.generate_content(prompt)
-    return response.text
+user = comps["profile_mgr"].get_or_create_user(st.session_state.user_id, "Client")
+active_funnel = comps["profile_mgr"].get_active_funnel(st.session_state.user_id)
 
-# --- UI Layout ---
+# --- Sidebar ---
+st.sidebar.markdown("### 📊 Search Status")
+st.sidebar.caption(f"Funnel: {active_funnel['name']}")
+if st.sidebar.button("Start New Search", type="secondary"):
+    new_f = comps["profile_mgr"].create_funnel(st.session_state.user_id, "New Search")
+    st.session_state.selected_property = None
+    st.rerun()
 
-st.title("📞 AI Real Estate Agent")
-st.markdown("*Conversational Property Matcher & Pitch Generator*")
+st.sidebar.divider()
+transcript_path = "data/transcripts.log"
+if os.path.exists(transcript_path):
+    st.sidebar.caption("🎙️ Live Transcript")
+    with open(transcript_path, "r", encoding="utf-8") as f:
+        lines = f.readlines()
+        for line in lines[-5:]:
+            st.sidebar.text(line.strip())
+    if st.sidebar.button("Clear Log"):
+        os.remove(transcript_path)
+        st.rerun()
 
-# Display Chat History
-for msg in st.session_state.messages:
-    with st.chat_message(msg["role"]):
-        st.markdown(msg["content"])
+# --- Main Layout (Persistent Master-Detail) ---
 
-# Input
-if prompt := st.chat_input("Describe what you are looking for..."):
-    # 1. User Message
-    st.session_state.messages.append({"role": "user", "content": prompt})
-    with st.chat_message("user"):
-        st.markdown(prompt)
+# Always create 2 columns to maintain layout stability
+# 65% Chat (Left), 35% Details (Right)
+main_col, details_col = st.columns([0.65, 0.35], gap="small")
 
-    # 2. Extract Intent
-    with st.spinner("Analyzing request..."):
-        new_prefs = extract_intent(prompt, st.session_state.user_preferences)
-        st.session_state.user_preferences = new_prefs
-        
-        # Debug: Show internal state in sidebar
-        st.sidebar.json(st.session_state.user_preferences)
+with main_col:
+    st.markdown('<div class="hero-title">AI Real Estate Consultant</div>', unsafe_allow_html=True)
+    st.markdown('<div class="hero-subtitle">Intelligent property search for Bangalore</div>', unsafe_allow_html=True)
 
-    # 3. Search Data
-    matches = search_properties(new_prefs, df)
-    
-    # 4. Generate Response
-    with st.spinner("Finding matches & preparing pitch..."):
-        ai_response = generate_sales_response(prompt, matches, new_prefs)
-    
-    # 5. Assistant Message
-    st.session_state.messages.append({"role": "assistant", "content": ai_response})
-    with st.chat_message("assistant"):
-        st.markdown(ai_response)
-        
-        # 6. Display Properties as Cards
+    # Chat Loop
+    for msg in st.session_state.messages:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+            
+            # Render Cards Inline
+            if "cards" in msg and msg['cards']:
+                matches_df = pd.DataFrame(msg["cards"])
+                if not matches_df.empty:
+                    # Always 2 columns for cards since we are in 65% width
+                    cols = st.columns(2)
+                    
+                    for idx, (_, row) in enumerate(matches_df.head(6).iterrows()):
+                        with cols[idx % 2]:
+                            # Card HTML
+                            st.markdown(f"""
+                            <div class="property-card">
+                                <div>
+                                     <div class="card-title">{row.get('Project Name', 'N/A')}</div>
+                                     <div class="card-dev">{row.get('Developer', 'Unknown')}</div>
+                                     <div style="color: #9ca3af; font-size: 0.8rem;">📍 {str(row.get('Location', 'N/A'))[:20]}</div>
+                                     <div style="color: #e2e8f0; font-weight: 500; font-size: 0.9rem; margin-top: 4px;">₹{row.get('Price per sqft (Enriched)', 'Ask')}</div>
+                                </div>
+                            </div>
+                            """, unsafe_allow_html=True)
+                            
+                            # Selection Logic
+                            def select_prop(r=row):
+                                st.session_state.selected_property = r.to_dict()
+                            
+                            st.button("View Details", key=f"btn_{idx}_{len(msg['content'])}", on_click=select_prop)
+
+
+    if prompt := st.chat_input("Ask about properties..."):
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.markdown(prompt)
+
+        with st.spinner("Processing..."):
+            # Orchestration -> Extraction -> Search -> Sales
+            decision = comps["orchestrator"].decide_action(prompt, active_funnel)
+            if decision.get("action") == "NEW":
+                active_funnel = comps["profile_mgr"].create_funnel(st.session_state.user_id, "New Search")
+                active_funnel['criteria'] = {} # Reset
+            
+            new_criteria = comps["extractor"].extract(prompt)
+            comps["profile_mgr"].update_funnel_criteria(st.session_state.user_id, active_funnel['id'], new_criteria)
+            
+            matches = comps["search_engine"].search(active_funnel['criteria'])
+            response_text = comps["sales"].generate_response(active_funnel['criteria'], matches, prompt)
+
+        msg_data = {"role": "assistant", "content": response_text}
         if not matches.empty:
-            st.markdown("### 🏘️ Recommended Properties")
-            
-            # Create a grid 
-            # We iterate through matches and place them in columns
-            cols = st.columns(4)
-            for idx, (_, row) in enumerate(matches.iterrows()):
-                col = cols[idx % 4]
-                with col:
-                    with st.container(border=True):
-                        st.subheader(f"{row.get('Project Name', 'N/A')}")
-                        st.caption(f"by {row.get('Developer', 'Unknown')}")
-                        st.markdown(f"📍 **{row.get('Location', 'N/A')}**")
-                        st.markdown(f"💰 **{row.get('Price per sqft (Enriched)', 'Ask')}**")
-                        st.markdown(f"🏗️ {row.get('Project Status', 'N/A')}")
-                        with st.expander("Details"):
-                            st.markdown(f"**Type:** {row.get('Project Type', 'N/A')}")
-                            st.markdown(f"**RERA:** {row.get('RERA Status (Enriched)', 'Pending')}")
-                            st.markdown(f"**Amenities:** {row.get('Key Amenities', 'Not listed')}")
+            msg_data["cards"] = matches.head(12).to_dict('records')
+        
+        st.session_state.messages.append(msg_data)
+        st.rerun()
+
+# --- Render Details Panel (Always in Right Column) ---
+with details_col:
+    if st.session_state.selected_property:
+        render_details_panel(st.session_state.selected_property)
+    else:
+        # Empty State
+        st.markdown("""
+        <div style='
+            height: 80vh; 
+            display: flex; 
+            align-items: center; 
+            justify-content: center; 
+            color: #3f3f46; 
+            text-align: center;
+            border: 1px dashed #27272a;
+            border-radius: 12px;
+        '>
+            <div>
+                <div style='font-size: 2rem; margin-bottom: 10px;'>👈</div>
+                <div>Select a property<br>to view details</div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)

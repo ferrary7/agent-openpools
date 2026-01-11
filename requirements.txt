@@ -3,3 +3,9 @@ pandas
 openpyxl
 google-generativeai
 python-dotenv
+fastapi
+uvicorn[standard]
+python-multipart
+twilio
+assemblyai
+watchfiles
